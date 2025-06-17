@@ -408,7 +408,114 @@ def schedule_customized_step(
 
     return prev_sample, pred_original_sample, alpha_prod_t_prev
 
+# equally to the function of schedule_customized_step (details refer to the discussion in https://github.com/LPengYang/MotionClone/issues/22)
+@torch.no_grad()
+def schedule_customized_step_candidate(
+        self,
+        model_output: torch.FloatTensor,
+        step_index: int,
+        sample: torch.FloatTensor,
+        eta: float = 0.0,
+        use_clipped_model_output: bool = False,
+        generator=None,
+        variance_noise: Optional[torch.FloatTensor] = None,
+        return_dict: bool = True,
 
+        # Guidance parameters
+        score=None,
+        guidance_scale=1.0,
+        indices=None, # [0]
+        return_middle = False,
+):
+    if self.num_inference_steps is None:
+        raise ValueError(
+            "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
+        )
+
+    # Support IF models
+    if model_output.shape[1] == sample.shape[1] * 2 and self.variance_type in ["learned", "learned_range"]:
+        model_output, predicted_variance = torch.split(model_output, sample.shape[1], dim=1)
+    else:
+        predicted_variance = None
+    
+    timestep = self.timesteps[step_index]
+    # 1. get previous step value (=t-1)
+    # prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
+    prev_timestep = self.timesteps[step_index+1] if step_index +1 <len(self.timesteps) else -1
+
+    # 2. compute alphas, betas
+    alpha_prod_t = self.alphas_cumprod[timestep]
+    alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
+
+    beta_prod_t = 1 - alpha_prod_t
+
+
+    if self.config.prediction_type == "epsilon":
+        if score is not None:
+            alpha_t = alpha_prod_t/alpha_prod_t_prev
+            model_output = model_output + guidance_scale/((1/alpha_t)**0.5-1)*score
+            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            pred_epsilon = model_output
+            # print("validation")
+        
+        else:
+            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            pred_epsilon = model_output
+    elif self.config.prediction_type == "sample":
+        pred_original_sample = model_output
+        pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
+    elif self.config.prediction_type == "v_prediction":
+        pred_original_sample = (alpha_prod_t ** 0.5) * sample - (beta_prod_t ** 0.5) * model_output
+        pred_epsilon = (alpha_prod_t ** 0.5) * model_output + (beta_prod_t ** 0.5) * sample
+    else:
+        raise ValueError(
+            f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`, or"
+            " `v_prediction`"
+        )
+
+    # 4. Clip or threshold "predicted x_0"
+    if self.config.thresholding:
+        pred_original_sample = self._threshold_sample(pred_original_sample)
+    elif self.config.clip_sample:
+        pred_original_sample = pred_original_sample.clamp(
+            -self.config.clip_sample_range, self.config.clip_sample_range
+        )
+
+    # 5. compute variance: "sigma_t(η)" -> see formula (16)
+    # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
+    variance = self._get_variance(timestep, prev_timestep)
+    std_dev_t = eta * variance ** (0.5)
+
+    if use_clipped_model_output:
+        # the pred_epsilon is always re-derived from the clipped x_0 in Glide
+        pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5) # [2, 4, 64, 64]
+    
+    if score is not None and return_middle:
+        return pred_epsilon, alpha_prod_t, alpha_prod_t_prev, pred_original_sample
+
+    pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t ** 2) ** (0.5) * pred_epsilon 
+
+    prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction 
+
+    if eta > 0:
+        if variance_noise is not None and generator is not None:
+            raise ValueError(
+                "Cannot pass both generator and variance_noise. Please make sure that either `generator` or"
+                " `variance_noise` stays `None`."
+            )
+
+        if variance_noise is None:
+            variance_noise = randn_tensor(
+                model_output.shape, generator=generator, device=model_output.device, dtype=model_output.dtype
+            )
+        variance = std_dev_t * variance_noise 
+
+        prev_sample = prev_sample + variance 
+
+    if not return_dict:
+        return (prev_sample,)
+
+    return prev_sample, pred_original_sample, alpha_prod_t_prev
 
 def schedule_set_timesteps(self, num_inference_steps: int, guidance_steps: int = 0, guiduance_scale: float = 0.0, device: Union[str, torch.device] = None,timestep_spacing_type= "uneven"):
         """
